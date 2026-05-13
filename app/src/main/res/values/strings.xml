@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">MobileClicker 使用无障碍服务模拟屏幕点击操作，用于自动化游戏控制。</string>
+</resources>
