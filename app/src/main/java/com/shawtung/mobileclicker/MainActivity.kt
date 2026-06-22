@@ -9,7 +9,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.SpannableStringBuilder
+import android.text.Spannable
+import android.text.method.LinkMovementMethod
+import android.text.style.ClickableSpan
 import android.util.Log
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -76,7 +81,13 @@ class MainActivity : AppCompatActivity() {
 
 
         ClickerService.statusCallback = { status ->
-            runOnUiThread { statusText.text = "Status: $status" }
+            runOnUiThread {
+                statusText.text = "Status: $status"
+                if (status == "Stopped") {
+                    startBtn.isEnabled = true
+                    stopBtn.isEnabled = false
+                }
+            }
         }
 
         requestNotificationPermissionIfNeeded()
@@ -92,9 +103,29 @@ class MainActivity : AppCompatActivity() {
     private fun updateA11yStatus() {
         val enabled = ClickerAccessibilityService.isActive
         val text = statusText.text.toString()
-        val a11yInfo = if (enabled) " | A11y: ✓" else " | A11y: ✗ (请开启无障碍)"
-        if (!text.contains("A11y")) {
-            statusText.text = "$text$a11yInfo"
+        if (text.contains("A11y")) return
+        if (enabled) {
+            statusText.text = "$text | A11y: ✓"
+        } else {
+            // Render "(请开启无障碍)" as a tappable link that jumps to the system
+            // Accessibility settings, so the user can enable the service in one tap.
+            val sb = SpannableStringBuilder("$text | A11y: ✗ ")
+            val link = "(请开启无障碍)"
+            val start = sb.length
+            sb.append(link)
+            sb.setSpan(object : ClickableSpan() {
+                override fun onClick(widget: View) = openAccessibilitySettings()
+            }, start, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            statusText.text = sb
+            statusText.movementMethod = LinkMovementMethod.getInstance()
+        }
+    }
+
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开无障碍设置: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 

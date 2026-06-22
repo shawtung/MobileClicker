@@ -20,9 +20,8 @@ class ModuleSelectActivity : AppCompatActivity() {
     )
 
     private val modules = listOf(
-        Module("nte打地鼠", "Neverness to Everness - 自动店长特供循环",
+        Module("自动店长特供1-9", "需要娜娜莉、薄荷、海月",
             MainActivity::class.java, "com.hottagames.yh.laohu"),
-        // Future modules go here
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
