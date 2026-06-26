@@ -21,7 +21,9 @@ class ModuleSelectActivity : AppCompatActivity() {
 
     private val modules = listOf(
         Module("自动店长特供1-9", "需要娜娜莉、薄荷、海月",
-            MainActivity::class.java, "com.hottagames.yh.laohu"),
+            StoreModuleActivity::class.java, "com.hottagames.yh.laohu"),
+        Module("格斗争霸赛挂机", "自动匹配",
+            PrisonFightActivity::class.java, "com.hottagames.yh.laohu"),
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
