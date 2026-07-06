@@ -41,11 +41,30 @@ class PrisonFightService : Service() {
         // Scan intervals (ms)
         const val SCAN_INTERVAL_MS = 2000L
         const val MATCHING_INTERVAL_MS = 5000L  // longer: nothing to do while waiting
+        const val SETTLEMENT_INTERVAL_MS = 1500L  // fast scan to catch the leave button
+
+        // Settlement: "离开" button fallback position (right-side overlay, bottom)
+        const val LEAVE_BTN_REL_X = 0.77
+        const val LEAVE_BTN_REL_Y = 0.88
 
         // Fixed button relative positions (estimated from screenshots, tune on device)
-        // Main menu: 4th icon from right in bottom nav bar
-        const val NAV_ICON_4_REL_X = 552.0 / 700
-        const val NAV_ICON_4_REL_Y = 24.0 / 320
+        // Main menu: 大亨 icon next to the mini-map
+        const val TYCOON_ICON_REL_X = 138.0 / 700
+        const val TYCOON_ICON_REL_Y = 22.0 / 320
+        // Wait time for the tycoon panel to fully load after tapping the icon
+        const val TYCOON_LOAD_WAIT_MS = 3000L
+        // Tycoon panel: "都市闲趣" hotspot (center of the city map)
+        const val TYCOON_LEISURE_REL_X = 0.50
+        const val TYCOON_LEISURE_REL_Y = 0.55
+        // Wait time for the sub-panel to load after tapping a hotspot
+        const val TYCOON_SUBPANEL_LOAD_WAIT_MS = 2000L
+        // Leisure panel ("都市闲趣" sub-panel): scroll region for the card grid
+        const val LEISURE_SCROLL_REL_X_LEFT = 500.0 / 2800
+        const val LEISURE_SCROLL_REL_X_RIGHT = 2200.0 / 2800
+        const val LEISURE_SCROLL_REL_Y_TOP = 320.0 / 1280
+        const val LEISURE_SCROLL_REL_Y_BOTTOM = 1090.0 / 1280
+        const val LEISURE_TARGET_LABEL = "格斗俱乐部"
+        const val MAX_LEISURE_SCROLLS = 15
         // Activity list: "前往" button (bottom-right)
         const val GO_BTN_REL_X = 628.0 / 700
         const val GO_BTN_REL_Y = 296.0 / 320
@@ -64,6 +83,12 @@ class PrisonFightService : Service() {
         const val SCROLL_DURATION_MS = 750L
         const val SCROLL_SETTLE_MS = 800L
 
+        // Activity panel close button (top-right X)
+        const val CLOSE_BTN_REL_X = 637.0 / 700
+        const val CLOSE_BTN_REL_Y = 23.0 / 320
+        // Max retries when target activity is not found in the list
+        const val MAX_NOT_FOUND_RETRIES = 3
+
         // Binarized OCR for art-text recognition
         const val LIST_COL_OCR_SCALE = 2f
         const val LIST_TEXT_LUMA = 150
@@ -73,7 +98,7 @@ class PrisonFightService : Service() {
     }
 
     // ── State machine ──
-    private enum class GameState { MAIN_MENU, ACTIVITY_LIST, FIGHT_CLUB, MATCHING, UNKNOWN }
+    private enum class GameState { MAIN_MENU, TYCOON_PANEL, LEISURE_PANEL, ACTIVITY_LIST, FIGHT_CLUB, MATCHING, SETTLEMENT, UNKNOWN }
 
     // ── Infrastructure (shared pattern with ClickerService) ──
     private var mediaProjection: MediaProjection? = null
@@ -101,6 +126,12 @@ class PrisonFightService : Service() {
     private var stuckCount = 0
     private var lastListSnapshot: String? = null
     private var activitySelected = false  // whether "格斗争霸赛" was tapped this visit
+    private var notFoundRetryCount = 0    // retries after target activity not found in list
+    // Leisure panel scroll search state
+    private var leisureScrollCount = 0
+    private var leisureLastSnapshot: String? = null
+    private var leisureStuckCount = 0     // consecutive identical snapshots
+    private var leisurePanelActive = false  // set after tapping 都市闲趣, cleared on transition
 
     private val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
 
@@ -357,6 +388,14 @@ class PrisonFightService : Service() {
                 handleMainMenu()
                 finishScan(bitmap, SCAN_INTERVAL_MS)
             }
+            GameState.TYCOON_PANEL -> {
+                handleTycoonPanel(items)
+                finishScan(bitmap, SCAN_INTERVAL_MS)
+            }
+            GameState.LEISURE_PANEL -> {
+                handleLeisurePanel(items)
+                finishScan(bitmap, SCAN_INTERVAL_MS)
+            }
             GameState.ACTIVITY_LIST -> {
                 // Run binarized OCR on the list column for better art-text recognition
                 runListColumnOcr(bitmap, items) { enhanced ->
@@ -372,11 +411,13 @@ class PrisonFightService : Service() {
                 log("  [MATCHING] Waiting for battle to end...")
                 finishScan(bitmap, MATCHING_INTERVAL_MS)
             }
+            GameState.SETTLEMENT -> {
+                handleSettlement(items)
+                finishScan(bitmap, SETTLEMENT_INTERVAL_MS)
+            }
             GameState.UNKNOWN -> {
-                // Treat as MAIN_MENU — try tapping the nav icon; if we're mid-transition
-                // it'll just do nothing and re-detect next cycle.
-                log("  [UNKNOWN] → treating as MAIN_MENU")
-                handleMainMenu()
+                // Likely a screen transition — do nothing, let the next scan re-detect.
+                log("  [UNKNOWN] No state matched, waiting...")
                 finishScan(bitmap, SCAN_INTERVAL_MS)
             }
         }
@@ -385,7 +426,14 @@ class PrisonFightService : Service() {
     // ── State detection ──
 
     private fun detectState(items: List<OcrItem>): GameState {
-        // MATCHING: highest priority. When "匹配成功" / "匹配中" / VS / countdown timer
+        // SETTLEMENT: highest priority. Post-battle results screen with a "离开" (leave)
+        // button, often showing a countdown like "离开(12)" or "离开（12）".
+        // Tapping it immediately saves ~15s of idle waiting.
+        if (items.any { it.text.contains("离开") || Regex("离.?开").containsMatchIn(it.text) }) {
+            return GameState.SETTLEMENT
+        }
+
+        // MATCHING: When "匹配成功" / "匹配中" / VS / countdown timer
         // appears, the fight is on (or loading into it) — the 随机匹配 button text may
         // still be visible but tapping it again is pointless and can glitch the UI.
         // MUST come before FIGHT_CLUB to avoid repeatedly re-tapping.
@@ -402,12 +450,31 @@ class PrisonFightService : Service() {
             return GameState.FIGHT_CLUB
         }
 
+        // LEISURE_PANEL: sub-panel inside "都市闲趣". Must check BEFORE TYCOON_PANEL
+        // because the sub-panel header also contains "都市闲趣" (e.g. "MEND都市闲趣").
+        // Detect by leisure-specific markers or the target label "格斗俱乐部".
+        if (items.any { "格斗俱乐部" in it.text } ||
+            items.any { "同城派送" in it.text || "雨燕出行" in it.text }) {
+            return GameState.LEISURE_PANEL
+        }
+
+        // TYCOON_PANEL: city map with hotspot labels like "都市闲趣"
+        if (items.any { "都市闲趣" in it.text || "闲趣" in it.text }) {
+            return GameState.TYCOON_PANEL
+        }
+
         // ACTIVITY_LIST: look for activity list markers — "前往" button visible
         val hasGoBtn = items.any { "前往" in it.text }
         // Also check for list-related UI: "活动" header
         val hasActivityHeader = items.any { "活动" in it.text }
         if (hasGoBtn || hasActivityHeader) {
             return GameState.ACTIVITY_LIST
+        }
+
+        // LEISURE_PANEL fallback: if we recently tapped "都市闲趣" and no other state
+        // matches, assume we're on the leisure sub-panel (格斗俱乐部 may be below the fold)
+        if (leisurePanelActive) {
+            return GameState.LEISURE_PANEL
         }
 
         // Default: MAIN_MENU (the bottom nav bar with game icons)
@@ -417,13 +484,112 @@ class PrisonFightService : Service() {
     // ── State handlers ──
 
     private fun handleMainMenu() {
-        log("  [MAIN_MENU] Tapping 4th nav icon from right")
-        tap(gameWindow.absX(NAV_ICON_4_REL_X), gameWindow.absY(NAV_ICON_4_REL_Y), "nav icon 4")
+        log("  [MAIN_MENU] Tapping tycoon icon next to mini-map")
+        tap(gameWindow.absX(TYCOON_ICON_REL_X), gameWindow.absY(TYCOON_ICON_REL_Y), "tycoon icon")
+        // Wait for the tycoon panel to fully load before next scan
+        Thread.sleep(TYCOON_LOAD_WAIT_MS)
         // Reset activity list search state
         scrollCount = 0
         stuckCount = 0
         lastListSnapshot = null
         activitySelected = false
+    }
+
+    private fun handleTycoonPanel(items: List<OcrItem>) {
+        // Multiple "都市闲趣" may appear — the header label at top-left and the actual
+        // hotspot in the center of the map. Pick the one closest to the screen center.
+        val candidates = items.filter { "都市闲趣" in it.text || "闲趣" in it.text }
+        val target = candidates.minByOrNull {
+            val dx = gameWindow.relX(it.cx) - 0.5
+            val dy = gameWindow.relY(it.cy) - 0.5
+            dx * dx + dy * dy
+        }
+        if (target != null) {
+            log("  [TYCOON_PANEL] Tapping \"${target.text}\" (OCR, rel=%.3f,%.3f)".format(
+                gameWindow.relX(target.cx), gameWindow.relY(target.cy)))
+            tap(target.cx, target.cy, "urban leisure (OCR)")
+        } else {
+            log("  [TYCOON_PANEL] Tapping urban leisure (fallback)")
+            tap(gameWindow.absX(TYCOON_LEISURE_REL_X), gameWindow.absY(TYCOON_LEISURE_REL_Y), "urban leisure (fallback)")
+        }
+        // Activate leisure panel tracking — next non-matching screen is the leisure sub-panel
+        leisurePanelActive = true
+        leisureScrollCount = 0
+        leisureLastSnapshot = null
+        leisureStuckCount = 0
+        // Wait for the sub-panel to fully load before next scan
+        Thread.sleep(TYCOON_SUBPANEL_LOAD_WAIT_MS)
+    }
+
+    private fun handleLeisurePanel(items: List<OcrItem>) {
+        // Search for "格斗俱乐部" in the visible area
+        val target = items.find { LEISURE_TARGET_LABEL in it.text }
+        if (target != null) {
+            log("  [LEISURE_PANEL] Found \"${target.text}\" at (${target.cx},${target.cy}) → tapping")
+            tap(target.cx, target.cy, "fight club")
+            leisurePanelActive = false
+            leisureScrollCount = 0
+            leisureLastSnapshot = null
+            leisureStuckCount = 0
+            return
+        }
+
+        // Not found — scroll the list to reveal more items
+        if (leisureScrollCount >= MAX_LEISURE_SCROLLS) {
+            log("  [LEISURE_PANEL] \"$LEISURE_TARGET_LABEL\" not found after $MAX_LEISURE_SCROLLS scrolls — giving up")
+            leisurePanelActive = false
+            leisureScrollCount = 0
+            leisureStuckCount = 0
+            return
+        }
+
+        // Detect if list is stuck (same content after scroll).
+        // Require 3 consecutive identical snapshots before giving up.
+        val snapshot = leisureListSnapshot(items)
+        if (leisureScrollCount > 0 && snapshot == leisureLastSnapshot) {
+            leisureStuckCount++
+            if (leisureStuckCount >= 3) {
+                log("  [LEISURE_PANEL] List stuck after 3 identical snapshots at scroll #$leisureScrollCount — giving up")
+                leisurePanelActive = false
+                leisureScrollCount = 0
+                leisureLastSnapshot = null
+                leisureStuckCount = 0
+                return
+            }
+        } else {
+            leisureStuckCount = 0
+        }
+        leisureLastSnapshot = snapshot
+
+        scrollLeisureList()
+        leisureScrollCount++
+    }
+
+    private fun scrollLeisureList() {
+        val x = gameWindow.absX((LEISURE_SCROLL_REL_X_LEFT + LEISURE_SCROLL_REL_X_RIGHT) / 2).toFloat()
+        val yHi = gameWindow.absY(LEISURE_SCROLL_REL_Y_TOP + 0.1).toFloat()
+        val yLo = gameWindow.absY(LEISURE_SCROLL_REL_Y_BOTTOM - 0.1).toFloat()
+
+        log("  [LEISURE-SCROLL] #$leisureScrollCount x=${x.toInt()} y=${yHi.toInt()}..${yLo.toInt()}")
+
+        val a11y = ClickerAccessibilityService.instance
+        if (a11y != null) {
+            // Swipe up (bottom → top) to scroll list up and reveal items below
+            a11y.swipe(x, yLo, x, yHi, SCROLL_DURATION_MS)
+        } else {
+            log("  [LEISURE-SCROLL] No A11y — cannot scroll")
+            return
+        }
+        Thread.sleep(SCROLL_SETTLE_MS)
+    }
+
+    private fun leisureListSnapshot(items: List<OcrItem>): String {
+        val listItems = items.filter {
+            gameWindow.relX(it.cx) in LEISURE_SCROLL_REL_X_LEFT..LEISURE_SCROLL_REL_X_RIGHT &&
+            gameWindow.relY(it.cy) in LEISURE_SCROLL_REL_Y_TOP..LEISURE_SCROLL_REL_Y_BOTTOM
+        }
+        return listItems.sortedBy { it.cy * 10000 + it.cx }
+            .joinToString("|") { "${it.cy / 30}:${it.text}" }
     }
 
     private fun handleActivityList(items: List<OcrItem>) {
@@ -448,15 +614,27 @@ class PrisonFightService : Service() {
             tap(gameWindow.absX(GO_BTN_REL_X), gameWindow.absY(GO_BTN_REL_Y), "go button")
             activitySelected = false
             scrollCount = 0
+            notFoundRetryCount = 0
             return
         }
 
         // Not found → scroll the list
         if (scrollCount >= MAX_SCROLLS) {
-            log("[ACTIVITY_LIST] \"$TARGET_ACTIVITY_NAME\" not found after $MAX_SCROLLS scrolls. Aborting.")
-            paused = true
-            statusCallback?.invoke("Paused: activity not found")
-            notify("\"$TARGET_ACTIVITY_NAME\" not found in activity list — paused")
+            notFoundRetryCount++
+            if (notFoundRetryCount > MAX_NOT_FOUND_RETRIES) {
+                log("[ACTIVITY_LIST] \"$TARGET_ACTIVITY_NAME\" not found after $MAX_NOT_FOUND_RETRIES retries. Aborting.")
+                paused = true
+                statusCallback?.invoke("Paused: activity not found after retries")
+                notify("\"$TARGET_ACTIVITY_NAME\" not found after $MAX_NOT_FOUND_RETRIES retries — paused")
+            } else {
+                log("[ACTIVITY_LIST] \"$TARGET_ACTIVITY_NAME\" not found (retry $notFoundRetryCount/$MAX_NOT_FOUND_RETRIES) — closing panel to retry")
+                tap(gameWindow.absX(CLOSE_BTN_REL_X), gameWindow.absY(CLOSE_BTN_REL_Y), "close panel (retry)")
+                // Reset scroll state for the next attempt
+                scrollCount = 0
+                stuckCount = 0
+                lastListSnapshot = null
+                activitySelected = false
+            }
             return
         }
 
@@ -470,10 +648,20 @@ class PrisonFightService : Service() {
         }
 
         if (stuckCount >= 4) {
-            log("[ACTIVITY_LIST] List stuck after $scrollCount scrolls — giving up.")
-            paused = true
-            statusCallback?.invoke("Paused: list stuck, can't find target")
-            notify("Activity list stuck — paused")
+            notFoundRetryCount++
+            if (notFoundRetryCount > MAX_NOT_FOUND_RETRIES) {
+                log("[ACTIVITY_LIST] List stuck after $MAX_NOT_FOUND_RETRIES retries — giving up.")
+                paused = true
+                statusCallback?.invoke("Paused: list stuck after retries")
+                notify("Activity list stuck after $MAX_NOT_FOUND_RETRIES retries — paused")
+            } else {
+                log("[ACTIVITY_LIST] List stuck (retry $notFoundRetryCount/$MAX_NOT_FOUND_RETRIES) — closing panel to retry")
+                tap(gameWindow.absX(CLOSE_BTN_REL_X), gameWindow.absY(CLOSE_BTN_REL_Y), "close panel (retry)")
+                scrollCount = 0
+                stuckCount = 0
+                lastListSnapshot = null
+                activitySelected = false
+            }
             return
         }
 
@@ -491,6 +679,21 @@ class PrisonFightService : Service() {
         } else {
             tap(gameWindow.absX(MATCH_BTN_REL_X), gameWindow.absY(MATCH_BTN_REL_Y), "random match (fallback)")
         }
+    }
+
+    private fun handleSettlement(items: List<OcrItem>) {
+        // Battle ended — results screen with "离开" (leave) button visible.
+        // Tap it immediately instead of waiting for the countdown to expire.
+        val leaveBtn = items.find { "离开" in it.text || Regex("离.?开").containsMatchIn(it.text) }
+        if (leaveBtn != null) {
+            log("  [SETTLEMENT] Tapping \"${leaveBtn.text}\" (OCR)")
+            tap(leaveBtn.cx, leaveBtn.cy, "leave (OCR)")
+        } else {
+            log("  [SETTLEMENT] Tapping leave button (fallback)")
+            tap(gameWindow.absX(LEAVE_BTN_REL_X), gameWindow.absY(LEAVE_BTN_REL_Y), "leave (fallback)")
+        }
+        // After tapping leave, the game returns to the main menu.
+        // Next scan cycle will detect MAIN_MENU and restart the full flow from step 1.
     }
 
     // ── Scroll the activity list ──
